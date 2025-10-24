@@ -3,7 +3,15 @@ import base64
 from pathlib import Path
 from typing import Optional, Union
 
+# ----------------- Configs opcionais -----------------
+# Se quiser forçar layout A4 com margens (em pontos; 72pt = 1in ~ 25,4mm):
+FORCAR_A4 = False
+A4_WIDTH, A4_HEIGHT = 595, 842  # pontos (~ 210 x 297mm)
+MARGEM = 24  # pontos
+
 # ----------------- Leitura/decodificação tolerante -----------------
+HEX_CHARS = set("0123456789abcdefABCDEF")
+
 def _read_text_any(path: Path) -> str:
     raw = path.read_bytes()
     for enc in ("utf-8", "utf-16-le", "utf-16-be", "latin-1"):
@@ -21,7 +29,7 @@ def _dec_bytes_from_text(s: str) -> Optional[bytes]:
     toks = re.findall(r"\d+", s)
     if not toks:
         return None
-    vals=[]
+    vals: List[int] = []
     for t in toks:
         v = int(t)
         if not (0 <= v <= 255):
@@ -87,39 +95,61 @@ def find_png_spans(b: bytes):
         yield (a, z+8)
         i = z+8
 
-def extract_images(b: bytes):
+def extract_images(b: bytes) -> List[Tuple[str, bytes]]:
     """Retorna lista de tuplas (fmt, bytes) em ordem de aparição."""
-    imgs = []
-    for a,z in find_jpeg_spans(b):
-        imgs.append(("jpg", b[a:z]))
-    for a,z in find_png_spans(b):
-        imgs.append(("png", b[a:z]))
-    # Ordena por posição original (misturando png/jpg)
-    # Para isso, revarremos mapeando posições:
-    pos_map = []
-    for a,z in find_jpeg_spans(b):
+    pos_map: List[Tuple[int, Tuple[str, bytes]]] = []
+    for a, z in find_jpeg_spans(b):
         pos_map.append((a, ("jpg", b[a:z])))
-    for a,z in find_png_spans(b):
+    for a, z in find_png_spans(b):
         pos_map.append((a, ("png", b[a:z])))
     pos_map.sort(key=lambda x: x[0])
     return [item for _, item in pos_map]
 
 # ----------------- Reempacotar em PDF -----------------
-def images_to_pdf(images: list[tuple[str, bytes]], out_pdf: Path) -> Path:
-    pages = []
+def _image_to_pdf_page(im: Image.Image) -> Image.Image:
+    """
+    Se FORCAR_A4=True, cria uma página A4 com a imagem centralizada e escalada
+    dentro das margens. Caso contrário, usa o tamanho da própria imagem.
+    """
+    if not FORCAR_A4:
+        # Retorna a própria imagem (Pillow salva direto em PDF)
+        return im
+
+    # Criar "página" branca A4
+    page = Image.new("RGB", (A4_WIDTH, A4_HEIGHT), "white")
+    max_w = A4_WIDTH - 2 * MARGEM
+    max_h = A4_HEIGHT - 2 * MARGEM
+
+    # Escala proporcional
+    w, h = im.size
+    scale = min(max_w / w, max_h / h)
+    new_w, new_h = max(1, int(w * scale)), max(1, int(h * scale))
+    im_resized = im.resize((new_w, new_h), Image.LANCZOS)
+
+    # Coloca centralizado
+    left = (A4_WIDTH - new_w) // 2
+    top  = (A4_HEIGHT - new_h) // 2
+    page.paste(im_resized, (left, top))
+    return page
+
+def images_to_pdf(images: List[Tuple[str, bytes]], out_pdf: Path) -> Path:
+    pages: List[Image.Image] = []
     for kind, data in images:
         with Image.open(BytesIO(data)) as im:
             if im.mode in ("RGBA", "P"):
                 im = im.convert("RGB")
-            pages.append(im.copy())
+            pages.append(_image_to_pdf_page(im))
+
     if not pages:
         raise RuntimeError("Nenhuma imagem válida para montar o PDF.")
+
     first, rest = pages[0], pages[1:]
     first.save(out_pdf, "PDF", save_all=True, append_images=rest)
     return out_pdf
 
 # ----------------- Pipeline principal -----------------
-def montar_pdf_de_imagens_do_txt(diretorio: Union[str, Path], nome_txt: str,
+def montar_pdf_de_imagens_do_txt(diretorio: Union[str, Path],
+                                 nome_txt: str,
                                  pdf_saida: str = "informe_por_imagem.pdf") -> Path:
     d = Path(diretorio)
     t = d / nome_txt
@@ -144,6 +174,7 @@ def montar_pdf_de_imagens_do_txt(diretorio: Union[str, Path], nome_txt: str,
     images_to_pdf(imgs, out_pdf)
     print(f"✅ PDF gerado a partir das imagens: {out_pdf.resolve()}")
     return out_pdf
+
 if __name__ == "__main__":
     d = input("Diretório do TXT: ").strip()
     f = input("Nome do TXT (ex: informe.txt): ").strip()
