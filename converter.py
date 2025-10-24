@@ -1,9 +1,7 @@
-import re
-import base64
-from pathlib import Path
-from typing import Optional, Union
+import jaydebeapi  # pip install JayDeBeApi
+import jpype
 
-# ----- Opcional (fallback imagem -> PDF) -----
+# Opcional (fallback imagem -> PDF)
 try:
     from PIL import Image
     from io import BytesIO
@@ -36,7 +34,7 @@ def _dec_bytes_from_text(s: str) -> Optional[bytes]:
     return bytes(vals)
 
 def to_bytes_best_effort(value: Union[bytes, bytearray, str]) -> bytes:
-    """Converte retorno da coluna para bytes, aceitando bytes diretos, hex textual, base64 ou decimal."""
+    """Converte retorno da coluna para bytes: bytes diretos, hex textual, base64 ou decimal."""
     if isinstance(value, (bytes, bytearray)):
         return bytes(value)
     if not isinstance(value, str):
@@ -83,7 +81,6 @@ def trim_to_eof(pdf_bytes: bytes) -> bytes:
         end += 1
     return pdf_bytes[:end]
 
-# ---- Fallback: extrair primeira imagem (JPEG/PNG) e montar PDF ----
 def find_first_image_span(b: bytes):
     # JPEG
     a = b.find(b"\xFF\xD8")
@@ -109,135 +106,117 @@ def image_bytes_to_single_page_pdf(img_bytes: bytes, out_pdf: Path) -> Path:
         im.copy().save(out_pdf, "PDF")
     return out_pdf
 
-# ====== CONEXÃO AO SYBASE (ASE) COM PYODBC ======
-def fetch_blob_from_sybase(
-    dsn: Optional[str] = None,
-    driver: Optional[str] = None,
-    server: Optional[str] = None,
-    port: Optional[int] = None,
-    database: Optional[str] = None,
-    uid: Optional[str] = None,
-    pwd: Optional[str] = None,
-    query: str = "SELECT arquivo FROM dbo.SuaTabela WHERE id = ?",
-    query_param: Optional[Union[int, str]] = None,
+def fetch_blob_via_jdbc_jtds(
+    user: str,
+    password: str,
+    table: str,
+    column: str,
+    where_clause: str = "id = ?",
+    param: Optional[Union[int, str]] = None,
+    jtds_jar_path: str = "C:/drivers/jtds-1.3.1.jar",  # ajuste o caminho do seu .jar
 ):
     """
-    Abre conexão via ODBC (FreeTDS), executa SET TEXTSIZE e retorna o valor da 1a coluna.
-    Use DSN ou DRIVER+SERVER+PORT.
+    Conecta no Sybase ASE via JDBC (jTDS) e retorna o valor da coluna.
+    Host: sybbco.alenet.net:4400, DB: DBinforme
     """
-    if dsn:
-        conn_str = f"DSN={dsn};UID={uid};PWD={pwd}"
-    else:
-        # Ex.: driver="FreeTDS", server="192.168.0.10", port=5000
-        # Para FreeTDS, você pode ter SERVERNAME configurado no freetds.conf
-        host = f"{server},{port}" if port else server
-        conn_str = f"DRIVER={{{{}}}};SERVER={host};DATABASE={database};UID={uid};PWD={pwd}".format(driver)
+    # Classe e URL JDBC (jTDS)
+    driver_class = "net.sourceforge.jtds.jdbc.Driver"
+    jdbc_url = (
+        "jdbc:jtds:sybase://sybbco.alenet.net:4400/DBinforme;"
+        "TDS=5.0;lastupdatecount=true;useCursors=true;CHARSET=utf8"
+    )
 
-    cn = pyodbc.connect(conn_str, autocommit=True)  # autocommit True para SET TEXTSIZE valer imediatamente
+    # Inicia a JVM se necessário
+    if not jpype.isJVMStarted():
+        jpype.startJVM(classpath=[jtds_jar_path])
+
+    conn = jaydebeapi.connect(driver_class, jdbc_url, [user, password])
     try:
-        cur = cn.cursor()
-        # *** CRÍTICO NO SYBASE ASE: sem isso, TEXT/IMAGE vem truncado (ex.: ~32KB) ***
+        cur = conn.cursor()
+        # IMPORTANTÍSSIMO no Sybase ASE: evita truncamento de TEXT/IMAGE (~32KB)
         cur.execute("SET TEXTSIZE 2147483647")
-        if query_param is None:
+
+        query = f"SELECT {column} FROM {table} WHERE {where_clause}"
+        if param is None:
             cur.execute(query)
         else:
-            cur.execute(query, query_param)
+            cur.execute(query, (param,))
         row = cur.fetchone()
         if not row:
             raise RuntimeError("Nenhuma linha retornada.")
         return row[0]
     finally:
-        cn.close()
+        conn.close()
 
-def salvar_informe_da_coluna_sybase(
-    saida_pdf: str,
-    dsn: Optional[str] = None,
-    driver: Optional[str] = None,
-    server: Optional[str] = None,
-    port: Optional[int] = None,
-    database: Optional[str] = None,
-    uid: Optional[str] = None,
-    pwd: Optional[str] = None,
-    tabela: str = "dbo.SuaTabela",
-    coluna: str = "arquivo",
-    where: str = "id = ?",
-    parametro: Optional[Union[int, str]] = None,
-):
-    """
-    Busca o BLOB/VARBINARY/TEXT/IMAGE da coluna informada e tenta salvar:
-      1) Como PDF (se começar com %PDF-)
-      2) Se não for PDF, tenta extrair UMA imagem e gerar um PDF a partir dela
-    """
-    query = f"SELECT {coluna} FROM {tabela} WHERE {where}"
-    valor = fetch_blob_from_sybase(
-        dsn=dsn, driver=driver, server=server, port=port,
-        database=database, uid=uid, pwd=pwd,
-        query=query, query_param=parametro
+def salvar_informe_sem_odbc(
+    user: str,
+    password: str,
+    table: str,
+    column: str,
+    where_clause: str,
+    param: Union[int, str],
+    out_pdf_path: str = "informe.pdf",
+    jtds_jar_path: str = "C:/drivers/jtds-1.3.1.jar",
+) -> Path:
+    valor = fetch_blob_via_jdbc_jtds(
+        user=user, password=password,
+        table=table, column=column,
+        where_clause=where_clause, param=param,
+        jtds_jar_path=jtds_jar_path
     )
-
-    # Converte retorno para bytes (casos: bytes, varbinary, nvarchar com '0x...', etc.)
     blob = to_bytes_best_effort(valor)
     print("Tamanho recebido (bytes):", len(blob))
     print("Cabeçalho (8 bytes):", blob[:8].hex().upper())
 
-    out_path = Path(saida_pdf)
+    out_path = Path(out_pdf_path)
 
-    # Caso PDF válido
     if is_pdf(blob):
         trimmed = trim_to_eof(blob)
         out_path.write_bytes(trimmed)
         print(f"PDF salvo em: {out_path.resolve()}  (len={len(trimmed)})")
         return out_path
 
-    # Caso não seja PDF: tenta extrair imagem única e montar PDF
+    # Se não for PDF, tenta imagem única → PDF
     span = find_first_image_span(blob)
     if span:
         kind, a, z = span
         img_bytes = blob[a:z]
-        # salva imagem para conferência
         img_path = out_path.with_suffix(f".{kind}")
         img_path.write_bytes(img_bytes)
         print(f"Imagem extraída: {img_path.name}  (len={len(img_bytes)})")
-        # monta PDF
         image_bytes_to_single_page_pdf(img_bytes, out_path)
         print(f"PDF (a partir da imagem) salvo em: {out_path.resolve()}")
         return out_path
 
-    # Se chegou aqui, o conteúdo não é PDF e não tem imagem “limpa”
+    # Se não reconheceu, salva dump p/ análise
     dump = out_path.with_suffix(".bin")
     dump.write_bytes(blob)
     raise RuntimeError(
-        "Conteúdo não é PDF e não encontrei imagem JPEG/PNG. "
+        "Conteúdo não é PDF e nenhuma imagem JPEG/PNG foi detectada. "
         f"Dump salvo: {dump}"
     )
 
-# ============== Exemplo de uso direto ==============
+# ===== Execução direta (exemplo) =====
 if __name__ == "__main__":
-    # Escolha uma das duas formas de conexão:
-    # A) Via DSN configurado no ODBC (recomendado)
-    # dsn = "MinhaFonteSybase"
-    # driver/server/port = None
+    usuario = input("Usuário do DB: ").strip()
+    senha   = input("Senha do DB: ").strip()
 
-    # B) Via DRIVER + SERVER + PORT (com FreeTDS)
-    dsn = None
-    driver = "FreeTDS"     # ou o nome do driver ODBC do Sybase instalado
-    server = "SEU_HOST"    # IP ou hostname
-    port   = 5000          # porta do ASE (comum: 5000/5001)
-    database = "SUA_BASE"
-    uid = "SEU_USUARIO"
-    pwd = "SUA_SENHA"
+    # Ajuste o caminho do .jar do jTDS abaixo:
+    jtds_jar = r"C:\drivers\jtds-1.3.1.jar"  # ou "/opt/drivers/jtds-1.3.1.jar"
 
+    # Informe sua tabela/coluna/where:
     tabela = "dbo.SuaTabela"
-    coluna = "arquivo"          # TEXT/IMAGE/VARBINARY
+    coluna = "arquivo"        # IMAGE/TEXT/VARBINARY/VARCHAR com HEX/Base64
     where  = "id = ?"
-    parametro = 123
+    param  = 123
 
     try:
-        salvar_informe_da_coluna_sybase(
-            saida_pdf="informe.pdf",
-            dsn=dsn, driver=driver, server=server, port=port,
-            database=database, uid=uid, pwd=pwd,
-            tabela=tabela, coluna=coluna, where=where, parametro=parametro
+        salvar_informe_sem_odbc(
+            user=usuario, password=senha,
+            table=tabela, column=coluna,
+            where_clause=where, param=param,
+            out_pdf_path="informe.pdf",
+            jtds_jar_path=jtds_jar
         )
     except Exception as e:
         print("Erro:", e)
