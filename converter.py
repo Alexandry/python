@@ -1,7 +1,21 @@
 import re
 import base64
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
+
+# ====== Opcional: pikepdf para reparo estruturado ======
+try:
+    import pikepdf  # pip install pikepdf
+    HAS_PIKEPDF = True
+except Exception:
+    HAS_PIKEPDF = False
+
+# ====== Opcional: Pillow para reempacotar imagens ======
+try:
+    from PIL import Image  # pip install pillow
+    HAS_PIL = True
+except Exception:
+    HAS_PIL = False
 
 HEX_CHARS = set("0123456789abcdefABCDEF")
 
@@ -66,34 +80,24 @@ def _to_bytes_from_text_layer(raw_text: str) -> bytes:
 
     raise ValueError("Não consegui interpretar como Base64, decimal ou hex.")
 
-def _ascii_is_all_hex_pairs(b: bytes) -> bool:
-    s = b.decode("latin-1", errors="ignore")
-    s = re.sub(r"\s+", "", s)
-    if len(s) < 8:
-        return False
-    if any(ch not in HEX_CHARS for ch in s):
-        return False
-    return len(s) % 2 == 0
-
-def _ascii_is_decimal_list(b: bytes) -> bool:
-    s = b.decode("latin-1", errors="ignore")
-    return bool(re.search(r"\d", s)) and bool(re.fullmatch(r"[\s,\t\r\n;0-9]+", s))
-
 def _maybe_double_decode(b: bytes) -> bytes:
-    if _ascii_is_all_hex_pairs(b):
-        s = re.sub(r"\s+", "", b.decode("latin-1", errors="ignore"))
-        return bytes.fromhex(s)
-    if _ascii_is_decimal_list(b):
-        s = b.decode("latin-1", errors="ignore")
-        out = _try_parse_decimal_bytes_from_text(s)
+    # Se ainda for texto ASCII contendo HEX/decimal, decodifica de novo
+    def _is_hex_ascii(x: bytes) -> bool:
+        t = re.sub(r"\s+", "", x.decode("latin-1", errors="ignore"))
+        return len(t) >= 8 and all(ch in HEX_CHARS for ch in t) and len(t) % 2 == 0
+    def _is_dec_ascii(x: bytes) -> bool:
+        t = x.decode("latin-1", errors="ignore")
+        return bool(re.fullmatch(r"[\s,\t\r\n;0-9]+", t)) and re.search(r"\d", t)
+
+    if _is_hex_ascii(b):
+        t = re.sub(r"\s+", "", b.decode("latin-1", errors="ignore"))
+        return bytes.fromhex(t)
+    if _is_dec_ascii(b):
+        t = b.decode("latin-1", errors="ignore")
+        out = _try_parse_decimal_bytes_from_text(t)
         if out is not None:
             return out
     return b
-
-# ====== PDF helpers ======
-
-def _is_pdf(b: bytes) -> bool:
-    return b.startswith(b"%PDF-")
 
 def _trim_to_eof(pdf_bytes: bytes) -> bytes:
     idx = pdf_bytes.rfind(b"%%EOF")
@@ -104,170 +108,141 @@ def _trim_to_eof(pdf_bytes: bytes) -> bytes:
         end += 1
     return pdf_bytes[:end]
 
-def _find_last_startxref(b: bytes) -> int:
-    """Retorna o índice do 'startxref' mais à direita ou -1."""
-    return b.rfind(b"startxref")
+def _is_pdf(b: bytes) -> bool:
+    return b.startswith(b"%PDF-")
 
-def _parse_startxref_value(b: bytes, start_idx: int) -> Optional[int]:
-    """
-    Após 'startxref', deve haver quebra de linha e um número ASCII.
-    Retorna o inteiro desse offset ou None.
-    """
-    if start_idx < 0:
-        return None
-    m = re.search(rb"startxref\s*[\r\n]+(\d+)", b[start_idx:start_idx+100], re.DOTALL)
-    if not m:
-        return None
-    try:
-        return int(m.group(1))
-    except Exception:
-        return None
+# ====== Extração de imagens para “data recovery” ======
 
-def _looks_like_xref_table_at(b: bytes, offset: int) -> bool:
-    """Confere se em 'offset' existe 'xref' textual."""
-    if 0 <= offset < len(b):
-        return b[offset:offset+4] == b"xref"
-    return False
+def _find_jpeg_spans(b: bytes):
+    # JPEG: SOI FFD8, termina em FFD9
+    i = 0
+    while True:
+        start = b.find(b"\xFF\xD8", i)
+        if start == -1:
+            break
+        end = b.find(b"\xFF\xD9", start + 2)
+        if end == -1:
+            break
+        yield (start, end + 2)
+        i = end + 2
 
-def _looks_like_xref_stream_at(b: bytes, offset: int) -> bool:
-    """
-    Para PDFs com xref stream: 'startxref' aponta para o INÍCIO de um objeto,
-    cujo conteúdo contém '/Type /XRef'. Checamos se há 'obj' e '/Type /XRef' próximo.
-    """
-    if not (0 <= offset < len(b)):
-        return False
-    # Busque algo como 'nnn n obj' nos próximos bytes
-    window = b[offset: offset+2048]
-    if b"obj" not in window:
-        return False
-    return b"/Type" in window and b"/XRef" in window
+def _find_png_spans(b: bytes):
+    # PNG: 89504E470D0A1A0A ... termina em IEND (49 45 4E 44 AE 42 60 82)
+    sig = b"\x89PNG\r\n\x1a\n"
+    i = 0
+    while True:
+        start = b.find(sig, i)
+        if start == -1:
+            break
+        # procura IEND
+        end = b.find(b"IEND\xAE\x42\x60\x82", start + len(sig))
+        if end == -1:
+            break
+        yield (start, end + len(b"IEND\xAE\x42\x60\x82"))
+        i = end + 8
 
-def _repair_startxref(b: bytes) -> Optional[bytes]:
-    """
-    Se 'startxref' estiver errado, tenta:
-      - Apontar para o último 'xref' textual encontrado; ou
-      - Apontar para o começo do último objeto cujo conteúdo indique '/Type /XRef'.
-    Regrava o sufixo 'startxref\n<novo>\n%%EOF'.
-    """
-    last_sx = _find_last_startxref(b)
-    if last_sx == -1:
+def _recover_images_to_pdf(b: bytes, out_pdf: Path) -> Optional[Path]:
+    if not HAS_PIL:
+        print("⚠️ Pillow não instalado; não consigo reempacotar imagens em PDF.")
         return None
 
-    # Procura candidatos: último 'xref' textual
-    cand_xref = b.rfind(b"xref")
-    cand_xref_stream = b.rfind(b"/Type /XRef")
+    imgs = []
+    for a, z in _find_jpeg_spans(b):
+        imgs.append(("jpg", b[a:z]))
+    for a, z in _find_png_spans(b):
+        imgs.append(("png", b[a:z]))
 
-    target_offset = None
-
-    if cand_xref != -1:
-        # Deve apontar exatamente para o 'xre'f
-        target_offset = cand_xref
-
-    if cand_xref_stream != -1:
-        # Para stream, precisamos do INÍCIO do objeto que contém '/Type /XRef'
-        # Tente recuar até encontrar o padrão "<num> <gen> obj"
-        start = max(0, cand_xref_stream - 200)
-        snippet = b[start:cand_xref_stream+200]
-        m = re.search(rb"(\d+)\s+(\d+)\s+obj", snippet)
-        if m:
-            # posição real do 'obj' no arquivo:
-            # ajusta índice global:
-            obj_local = m.start()
-            obj_global = start + obj_local
-            # Se não tínhamos xref textual, use o stream
-            if target_offset is None:
-                target_offset = obj_global
-
-    if target_offset is None:
+    if not imgs:
+        print("⚠️ Não encontrei imagens JPEG/PNG para recuperar.")
         return None
 
-    # Monte novo sufixo startxref/EOF substituindo o bloco final
-    # Recorte até antes de 'startxref'
-    head = b[:last_sx]
-    tail = f"\nstartxref\n{target_offset}\n%%EOF\n".encode("ascii")
-    return head + tail
+    # Constrói PDF com uma imagem por página
+    pages = []
+    for kind, data in imgs:
+        from io import BytesIO
+        try:
+            with Image.open(BytesIO(data)) as im:
+                if im.mode in ("RGBA", "P"):
+                    im = im.convert("RGB")
+                pages.append(im.copy())
+        except Exception:
+            continue
+
+    if not pages:
+        print("⚠️ Encontrei imagens, mas nenhuma pôde ser aberta pelo Pillow.")
+        return None
+
+    first, rest = pages[0], pages[1:]
+    first.save(out_pdf, "PDF", save_all=True, append_images=rest)
+    return out_pdf
 
 # ====== Pipeline principal ======
 
-def converter_txt_para_pdf_com_reparo(diretorio: Union[str, Path],
-                                      arquivo_txt: str,
-                                      saida_pdf: str = "informe_convertido.pdf",
-                                      saida_pdf_reparado: str = "informe_reparado.pdf",
-                                      verbose: bool = True) -> tuple[Path, Optional[Path]]:
+def reparar_ou_recuperar_pdf_de_txt(
+    diretorio: Union[str, Path],
+    arquivo_txt: str,
+    pdf_convertido: str = "informe_convertido.pdf",
+    pdf_reparado: str = "informe_reparado.pdf",
+    pdf_recuperado: str = "informe_recuperado.pdf",
+) -> dict:
     dir_path = Path(diretorio)
     txt_path = dir_path / arquivo_txt
-    out_pdf = dir_path / saida_pdf
-    out_pdf_rep = dir_path / saida_pdf_reparado
+    out_conv = dir_path / pdf_convertido
+    out_rep = dir_path / pdf_reparado
+    out_rec = dir_path / pdf_recuperado
 
     if not txt_path.exists():
         raise FileNotFoundError(f"TXT não encontrado: {txt_path}")
 
-    # 1) decode em camadas
+    # 1) Decode em camadas
     raw_text = _read_text_any(txt_path)
     stage1 = _to_bytes_from_text_layer(raw_text)
     stage2 = _maybe_double_decode(stage1)
     candidate = stage2
 
-    # 2) alinhar em '%PDF-' se houver ruído no começo
+    # 2) Alinhar em %PDF-
     pos = candidate.find(b"%PDF-")
     if pos > 0:
-        if verbose:
-            print(f"[ajuste] '%PDF-' encontrado em offset {pos}, recortando prefixo.")
         candidate = candidate[pos:]
 
-    # 3) trim até %%EOF
+    # 3) Trim %%EOF
     trimmed = _trim_to_eof(candidate)
 
-    # 4) salvar o “convertido”
-    out_pdf.write_bytes(trimmed)
-    if verbose:
-        print(f"[salvo] {out_pdf.name} len={len(trimmed)} head={trimmed[:8].hex().upper()}")
+    # 4) Salvar o convertido (mesmo sem startxref)
+    out_conv.write_bytes(trimmed)
+    result = {
+        "convertido": str(out_conv.resolve()),
+        "reparado": None,
+        "recuperado": None,
+        "len_convertido": len(trimmed),
+        "header": trimmed[:8].hex().upper(),
+    }
+    print(f"[convertido] {out_conv.name} len={len(trimmed)} header={result['header']}")
 
-    # 5) validar startxref
-    last_sx = _find_last_startxref(trimmed)
-    sx_val = _parse_startxref_value(trimmed, last_sx) if last_sx != -1 else None
-    ok = False
-    reason = ""
+    # 5) Tentar reparo com pikepdf (se disponível)
+    if HAS_PIKEPDF:
+        try:
+            with pikepdf.open(out_conv) as pdf:
+                pdf.save(out_rep)
+            result["reparado"] = str(out_rep.resolve())
+            print(f"[reparado] {out_rep.name} salvo via pikepdf")
+            return result
+        except Exception as e:
+            print(f"[pikepdf] falhou ao reparar: {e}")
 
-    if last_sx == -1 or sx_val is None:
-        reason = "startxref ausente ou ilegível"
+    # 6) Data recovery: extrair imagens e reempacotar em PDF
+    rec = _recover_images_to_pdf(trimmed, out_rec)
+    if rec:
+        result["recuperado"] = str(out_rec.resolve())
+        print(f"[recuperado] {out_rec.name} criado com imagens extraídas.")
     else:
-        if _looks_like_xref_table_at(trimmed, sx_val) or _looks_like_xref_stream_at(trimmed, sx_val):
-            ok = True
-        else:
-            reason = f"startxref aponta para offset {sx_val}, que não parece xref nem xref stream."
+        print("[recuperado] não foi possível criar PDF de recuperação.")
 
-    if ok:
-        if verbose:
-            print("[ok] startxref válido; tente abrir o informe_convertido.pdf.")
-        return out_pdf, None
+    return result
 
-    # 6) tentar reparo de startxref
-    fixed = _repair_startxref(trimmed)
-    if not fixed:
-        if verbose:
-            print(f"[falha-reparo] Não consegui ajustar startxref ({reason}).")
-        return out_pdf, None
-
-    out_pdf_rep.write_bytes(fixed)
-    if verbose:
-        new_last_sx = _find_last_startxref(fixed)
-        new_sx_val = _parse_startxref_value(fixed, new_last_sx) if new_last_sx != -1 else None
-        print(f"[reparo] Gerado {out_pdf_rep.name} len={len(fixed)} "
-              f"startxref={new_sx_val}")
-    return out_pdf, out_pdf_rep
-
-# ====== Execução ======
-# ============== Execução direta ==============
+# ===== Execução direta =====
 if __name__ == "__main__":
-    # Exemplo: variável de input (diretório)
-    diretorio_input = input("Informe o diretório onde está o arquivo TXT: ").strip()
-    nome_arquivo = input("Informe o nome do arquivo TXT (ex: informe.txt): ").strip()
-
-    try:
-        path_pdf, path_pdf_reparado = converter_txt_para_pdf_com_reparo(d, f)
-        print("✅ Arquivo principal:", path_pdf.resolve())
-        if path_pdf_reparado:
-            print("🩹 Arquivo reparado:", path_pdf_reparado.resolve())
-    except Exception as e:
-        print("❌ Erro:", e)
+    d = input("Diretório do TXT: ").strip()
+    f = input("Nome do TXT (ex: informe.txt): ").strip()
+    info = reparar_ou_recuperar_pdf_de_txt(d, f)
+    print(info)
